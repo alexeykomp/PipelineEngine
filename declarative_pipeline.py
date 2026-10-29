@@ -125,7 +125,7 @@ class PipelineEngine:
         self._dispatcher_stop_event = threading.Event()
         self._dispatcher_thread: threading.Thread | None = None
 
-        # Clean Lifecycle Callbacks
+        # Lifecycle Callbacks
         self.on_step_started: Callable[[PipelineElement, Callable], None] | None = None
         self.on_step_progress: Callable[[PipelineElement, Callable, float], None] | None = None
         self.on_step_finished: Callable[[PipelineElement, Callable, bool], None] | None = None
@@ -147,7 +147,7 @@ class PipelineEngine:
                 self._dispatcher_thread.start()
 
     def shutdown(self, wait: bool = True) -> None:
-        """Gracefully shuts down the dispatcher and thread pool from an external thread."""
+        """Shuts down the dispatcher and thread pool from an external thread."""
         self._dispatcher_stop_event.set()
         with self._lock:
             if self._executor and not getattr(self._executor, '_shutdown', False):
