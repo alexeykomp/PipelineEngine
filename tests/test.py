@@ -7,7 +7,7 @@ import threading
 import time
 import unittest
 
-from declarative_pipeline import (
+from pipeline_engine import (
     PipelineElement,
     PipelineEngine,
     PipelinePlan,

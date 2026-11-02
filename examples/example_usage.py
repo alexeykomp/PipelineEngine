@@ -6,8 +6,7 @@ digital asset ingestion workflow.
 """
 
 import time
-from declarative_pipeline import PipelineElement, PipelineEngine, PipelinePlan
-
+from pipeline_engine import PipelineEngine, PipelineElement, PipelinePlan, TaskState
 
 class ProductAsset(PipelineElement):
     """Domain model representing a set of product photos to process."""
