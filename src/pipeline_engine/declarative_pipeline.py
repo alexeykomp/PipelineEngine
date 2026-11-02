@@ -18,7 +18,7 @@ from collections.abc import Callable
 from concurrent.futures import ThreadPoolExecutor
 from enum import Enum, auto
 from queue import Empty, Queue
-from typing import Any
+from typing import Any, Union
 
 logger = logging.getLogger(__name__)
 
@@ -36,8 +36,9 @@ class TaskState(Enum):
 class StepReport:
     """Internal completion message passed from worker to dispatcher."""
     element: PipelineElement
-    step_func: Callable[..., bool]
+    step_func: Callable[[PipelineElement], bool]
     success: bool
+    returned: Any
     exception: Exception | None = None
 
 
@@ -51,8 +52,9 @@ class PipelineElement:
         self.identifier = identifier
         self.state: TaskState = TaskState.WAITING
         self.status_message: str = "Waiting"
-        self.current_step: Callable[..., Any] | None = None
+        self.current_step: Callable[[PipelineElement], Any] | None = None
         self.step_pointer: int = 0
+        self.history: list[str] = []
         self.progress: float = 0.0
 
         self._abort_event = threading.Event()
@@ -90,7 +92,6 @@ class PipelineElement:
                 self._progress_reporter(val)
 
 
-@dataclasses.dataclass
 class PipelinePlan:
     """
     Defines the sequence of operations and optional concurrency constraints.
@@ -98,8 +99,56 @@ class PipelinePlan:
     :param sequence: Ordered list of step callables. Signature: `step_func(element) -> bool`
     :param step_limits: Max concurrent workers per step, e.g. `{write_to_db: 1, upload_to_nas: 2}`
     """
-    sequence: list[Callable[..., bool]]
-    step_limits: dict[Callable[..., bool], int] = dataclasses.field(default_factory=dict)
+    sequence: list[Step]
+    step_limits: dict[Union[Step, Callable[[PipelineElement], bool]], int]
+
+    def __init__(self, sequence: list[Union[Callable[[PipelineElement], bool], Step]], step_limits: dict[Callable | Step, int] | None = None):
+        self.step_limits = step_limits if step_limits is not None else {}
+        # Normalize sequence to Step instances, preserving identifiers
+        self.steps: list[Step] = [
+            s if isinstance(s, Step) else Step(s) for s in sequence
+        ]
+
+        # Build a mapping from step identifiers to their index for quick lookup
+        self.id_to_index: dict[str, int] = {}
+        for idx, step in enumerate(self.steps):
+            if step.identifier in self.id_to_index:
+                raise ValueError(
+                    f"Duplicate step ID '{step.identifier}' at index {idx}. "
+                    f"Use Step(fn, identifier='unique_name') for repeating steps."
+                )
+            self.id_to_index[step.identifier] = idx
+
+    def __len__(self):
+        return len(self.steps)
+
+    def __getitem__(self, idx: int) -> Step:
+        return self.steps[idx]
+
+
+class Step:
+    """
+    Represents a single step in the pipeline.
+    Each step is a callable that takes a PipelineElement and returns a boolean indicating success.
+    """
+
+    def __init__(self, func: Callable[[PipelineElement], bool], identifier: str | None = None):
+        self.func = func
+        self.identifier = identifier if identifier is not None else func.__name__
+
+    def __call__(self, element: PipelineElement) -> bool:
+        return self.func(element)
+
+
+class JumpTo:
+    """Signal to jump to a specific step in the pipeline for a given element."""
+    def __init__(self, step_id: Union[str, Step, Callable[[PipelineElement], bool]]):
+        self.step_index = step_id
+
+
+class Finish:
+    """Signal to finish the pipeline for a given element."""
+    pass
 
 
 class PipelineEngine:
@@ -118,8 +167,8 @@ class PipelineEngine:
         self._active_elements: list[PipelineElement] = []
         self._element_plans: dict[PipelineElement, PipelinePlan] = {}
 
-        self._step_active_counts: dict[Callable[..., bool], int] = defaultdict(int)
-        self._step_waiting_queues: dict[Callable[..., bool], list[PipelineElement]] = defaultdict(list)
+        self._step_active_counts: dict[Callable[[PipelineElement], bool], int] = defaultdict(int)
+        self._step_waiting_queues: dict[Callable[[PipelineElement], bool], list[PipelineElement]] = defaultdict(list)
 
         self._lock = threading.Lock()
         self._dispatcher_stop_event = threading.Event()
@@ -202,7 +251,7 @@ class PipelineEngine:
 
             current_step = plan.sequence[el.step_pointer]
             el.current_step = current_step
-            el.status_message = current_step.__name__
+            el.status_message = f'Next step is {current_step.__name__}'
             el.state = TaskState.RUNNING
 
             limit = plan.step_limits.get(current_step)
@@ -213,9 +262,9 @@ class PipelineEngine:
             if limit is not None:
                 self._step_active_counts[current_step] += 1
 
-        self._dispatch_to_executor(el, current_step, plan)
+        self._dispatch_to_executor(el, current_step)
 
-    def _dispatch_to_executor(self, el: PipelineElement, step: Callable[..., bool], plan: PipelinePlan) -> None:
+    def _dispatch_to_executor(self, el: PipelineElement, step: Step) -> None:
         """Executes on_step_started synchronously, then sends work to thread pool."""
         el.progress = 0.0
 
@@ -236,15 +285,16 @@ class PipelineEngine:
 
         def worker_task() -> None:
             if el.is_aborted:
-                self._completion_queue.put(StepReport(el, step, success=False))
+                self._completion_queue.put(StepReport(el, step, success=False, returned=None))
                 return
 
             try:
+                el.history.append(step.identifier)
                 res = step(el)
-                self._completion_queue.put(StepReport(el, step, success=bool(res)))
+                self._completion_queue.put(StepReport(el, step, success=True, returned=res))
             except Exception as exc:
                 logger.error("Exception in step %s on %s: %s", step.__name__, el, traceback.format_exc())
-                self._completion_queue.put(StepReport(el, step, success=False, exception=exc))
+                self._completion_queue.put(StepReport(el, step, success=False, exception=exc, returned=None))
 
         with self._lock:
             if self._executor and not getattr(self._executor, '_shutdown', False):
